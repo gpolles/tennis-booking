@@ -17,6 +17,7 @@ from pathlib import Path
 USER_NAME = os.getenv("PLAYBYPOINT_EMAIL", "")
 USER_PWD = os.getenv("PLAYBYPOINT_PASSWORD", "")
 BOOKED_DATE_FILE = os.getenv("BOOKED_DATE_FILE")
+BOOKING_SLOTS_ENV = os.getenv("BOOKING_SLOTS", "")
 
 
 # Global wait constants: base wait (seconds) plus up-to `WAIT_JITTER` seconds random
@@ -69,34 +70,94 @@ def _parse_date_iso(s: str) -> date | None:
         return None
 
 
-def load_latest_booked_date() -> date | None:
-    """Load last booked date from file pointed to by BOOKED_DATE_FILE env var.
+def parse_booking_slots(slots_str: str) -> list[tuple[str, list[str]]]:
+    """Parse booking slots from environment variable format.
 
-    Returns a date or None if not available/parseable.
+    Format: "day1_slot1_slot2:...,day2_slot1_slot2:..."
+    Example: "Sun_8am_8:30am_9am,Tue_5pm_5:30pm"
+
+    Args:
+        slots_str: String containing booking slots configuration
+
+    Returns:
+        List of (day, time_slots_list) tuples. Empty list if slots_str is empty.
+    """
+    if not slots_str or not slots_str.strip():
+        return []
+
+    bookings = []
+    for day_entry in slots_str.split(","):
+        day_entry = day_entry.strip()
+        if not day_entry:
+            continue
+        parts = day_entry.split("_")
+        if len(parts) < 2:
+            logging.warning(
+                "Invalid booking slot format '%s' (expected day_slot1_slot2_...)", day_entry)
+            continue
+        day = parts[0].strip()
+        time_slots = [slot.strip() for slot in parts[1:]]
+        bookings.append((day, time_slots))
+    return bookings
+
+
+def load_booked_slots() -> set[tuple[str, str]]:
+    """Load booked slots from file pointed to by BOOKED_DATE_FILE env var.
+
+    File format: one line per booked slot in format "day_time_slot"
+    Example lines:
+        Sun_8am
+        Sun_8:30am
+        Tue_5pm
+
+    Returns a set of (day, time_slot) tuples. Empty set if not available.
     """
     path = BOOKED_DATE_FILE
     if not path:
-        return None
+        return set()
     p = Path(path)
     if not p.exists():
-        return None
+        return set()
     try:
         text = p.read_text(encoding="utf-8")
     except Exception:
         logging.warning("Failed to read booked-date file: %s", path)
-        return None
-    return _parse_date_iso(text)
+        return set()
+
+    booked = set()
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Split from right to handle times like "5:30pm"
+        parts = line.rsplit("_", 1)
+        if len(parts) == 2:
+            day, time_slot = parts
+            booked.add((day.strip(), time_slot.strip()))
+    return booked
 
 
-def save_latest_booked_date(d: date) -> None:
+def save_booked_slot(day: str, time_slot: str) -> None:
+    """Save a booked slot to the file.
+
+    Args:
+        day: Day of week (e.g., 'Sun', 'Tue')
+        time_slot: Time slot (e.g., '8am', '5:30pm')
+    """
     path = BOOKED_DATE_FILE
     if not path:
         return
     p = Path(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(d.isoformat(), encoding="utf-8")
-        logging.info("Wrote latest booked date %s to %s", d.isoformat(), path)
+        # Load existing booked slots
+        booked = load_booked_slots()
+        # Add the new slot
+        booked.add((day, time_slot))
+        # Write all slots back
+        lines = [f"{day}_{time_slot}" for day, time_slot in sorted(booked)]
+        p.write_text("\n".join(lines), encoding="utf-8")
+        logging.info("Wrote booked slot %s_%s to %s", day, time_slot, path)
     except Exception:
         logging.exception("Failed to write booked-date file: %s", path)
 
@@ -303,13 +364,13 @@ def book_court(playwright: Playwright, username: str, password: str,
         context.close()
         browser.close()
 
-    # after browser closed, persist the booked date if successful
+    # after browser closed, persist the booked slots if successful
     if success:
         try:
-            booked = next_date_for_day(day)
-            save_latest_booked_date(booked)
+            for time_slot in time_slots:
+                save_booked_slot(day, time_slot)
         except Exception:
-            logging.exception("Failed to save latest booked date")
+            logging.exception("Failed to save booked slots")
     else:
         logging.info(
             "No available time slots found for the specified parameters.")
@@ -318,28 +379,50 @@ def book_court(playwright: Playwright, username: str, password: str,
 
 def main():
     """Main entry point for the application."""
-    # If a booked-date file is provided and its date is in the future, exit
-    saved = load_latest_booked_date()
-    if saved and saved >= date.today():
-        logging.info(
-            "Latest booked date %s is today or in the future; exiting.", saved.isoformat())
-        return
     if not USER_NAME or not USER_PWD:
         logging.error(
             "Error: PLAYBYPOINT_EMAIL and PLAYBYPOINT_PASSWORD environment variables required")
         return
 
+    # Parse booking slots from environment variable
+    bookings = parse_booking_slots(BOOKING_SLOTS_ENV)
+    if not bookings:
+        logging.error(
+            "Error: BOOKING_SLOTS environment variable not set or invalid format. "
+            "Expected format: 'day1_slot1_slot2:...,day2_slot1_slot2:...'")
+        return
+
+    # Load already booked slots
+    booked_slots = load_booked_slots()
+
+    # Filter out already-booked slots
+    pending_bookings = []
+    for day, time_slots in bookings:
+        # Keep only time slots that haven't been booked yet
+        pending_slots = [
+            slot for slot in time_slots
+            if (day, slot) not in booked_slots
+        ]
+        if pending_slots:
+            pending_bookings.append((day, pending_slots))
+        else:
+            logging.info("All slots for %s are already booked", day)
+
+    if not pending_bookings:
+        logging.info("All requested slots are already booked; exiting.")
+        return
+
     with sync_playwright() as playwright:
-        if book_court(
-            playwright,
-            username=USER_NAME,
-            password=USER_PWD,
-            day="Sat",
-            time_slots=["8:30am", "9am"],
-            sports=["Tennis", "Free Play"],
-            extra_player_count=1
-        ):
-            save_latest_booked_date(next_date_for_day("Sat"))
+        for day, time_slots in pending_bookings:
+            book_court(
+                playwright,
+                username=USER_NAME,
+                password=USER_PWD,
+                day=day,
+                time_slots=time_slots,
+                sports=["Tennis", "Free Play"],
+                extra_player_count=1
+            )
 
 
 if __name__ == "__main__":
