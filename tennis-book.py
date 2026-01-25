@@ -132,6 +132,8 @@ def login(page, username: str, password: str) -> None:
         password: Password for login
     """
     page.goto("https://app.playbypoint.com/users/sign_in")
+    wait_random()  # Wait for page to load
+    wait_random()  # Extra wait for stability
     email = page.get_by_role("textbox", name="Email")
     ensure_element(email, "Email textbox")
     email.click()
