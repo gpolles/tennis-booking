@@ -41,21 +41,37 @@ logging.basicConfig(
 )
 
 
-def ensure_element(locator, description: str):
+def ensure_element(locator, description: str, max_retries: int = 3, base_delay: float = 1.0):
     """Verify the given Playwright locator matches at least one element.
 
-    Logs an error and raises RuntimeError if the element is not found.
+    Retries with exponential backoff if the element is not found.
+    Logs an error and raises RuntimeError if all retries fail.
     Returns the locator for convenience.
+
+    Args:
+        locator: Playwright locator object
+        description: Human-readable description of the element
+        max_retries: Number of retries with exponential backoff (default: 3)
+        base_delay: Base delay in seconds for exponential backoff (default: 1.0)
     """
-    try:
-        count = locator.count()
-    except Exception:
-        logging.error("Failed to query element: %s", description)
-        raise
-    if count == 0:
-        logging.error("%s not found.", description)
-        raise RuntimeError(f"{description} not found")
-    return locator
+    for attempt in range(max_retries):
+        try:
+            count = locator.count()
+            if count > 0:
+                return locator
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logging.error("Failed to query element after %d retries: %s", max_retries, description)
+                raise
+        
+        # Calculate exponential backoff with jitter
+        if attempt < max_retries - 1:
+            delay = base_delay * (2 ** attempt) + random.random() * 0.1
+            logging.debug("Element not found: %s, retrying in %.2fs (attempt %d/%d)", description, delay, attempt + 1, max_retries)
+            time.sleep(delay)
+    
+    logging.error("%s not found after %d retries.", description, max_retries)
+    raise RuntimeError(f"{description} not found")
 
 
 def _parse_date_iso(s: str) -> date | None:
@@ -193,8 +209,6 @@ def login(page, username: str, password: str) -> None:
         password: Password for login
     """
     page.goto("https://app.playbypoint.com/users/sign_in")
-    wait_random()  # Wait for page to load
-    wait_random()  # Extra wait for stability
     email = page.get_by_role("textbox", name="Email")
     ensure_element(email, "Email textbox")
     email.click()
@@ -210,6 +224,7 @@ def login(page, username: str, password: str) -> None:
 
 def navigate_to_booking(page) -> None:
     """Navigate from login page to booking page."""
+    time.sleep(1)  # Wait for login to complete and redirect
     link = page.get_by_role("link", name="Book Now")
     ensure_element(link, "Book Now link")
     link.click()
@@ -243,13 +258,13 @@ def explore_and_select_times(page, day: str, sport: str, end_times: list[str]) -
         bool: True if time slots were found and selected, False otherwise
     """
     # Click the sport tab
-    wait_random()  # Wait for page to stabilize
     select_sport(page, sport)
 
     # Click the day
-    wait_random()  # Wait for sport tab to load
     day_btn = page.get_by_role("button", name=day)
-    if not day_btn:
+    try:
+        ensure_element(day_btn, f"Day button '{day}'")
+    except RuntimeError:
         logging.warning("Day button for %s not found.", day)
         return False
     day_btn.click()
@@ -257,11 +272,12 @@ def explore_and_select_times(page, day: str, sport: str, end_times: list[str]) -
     # Find and click available time slots matching the ranges
     buttons = []
     for end_time in end_times:
-        wait_random()  # Wait for time slots to load
         # Look for buttons with time slot pattern (e.g., "-8:30am" or "-9am")
         # Unavailable buttons have class "red", so we skip those.
         end_button = page.locator(f'button:has-text("-{end_time}"):not(.red)')
-        if end_button.count() == 0:
+        try:
+            ensure_element(end_button, f"Time slot ending at {end_time}")
+        except RuntimeError:
             logging.warning(
                 "No available time slot ending at %s found.", end_time)
             return False
@@ -291,7 +307,6 @@ def add_players(page, count: int = 1) -> None:
     add_players_btn = page.get_by_role("button", name="Add Players")
     ensure_element(add_players_btn, "Add Players button")
     add_players_btn.click()
-    wait_random()  # Wait for player addition modal to appear
     for i in range(1, count + 1):
         add_btn = page.get_by_role("button", name="Add").nth(i)
         ensure_element(add_btn, f"Add button #{i}")
@@ -333,26 +348,20 @@ def book_court(playwright: Playwright, username: str, password: str,
     try:
         # Login flow
         login(page, username, password)
-        wait_random()  # Wait a moment before navigating
         navigate_to_booking(page)
 
         # Selection flow
         for sport in sports:
-            wait_random()  # Wait a moment before selecting sport/day
             if not explore_and_select_times(page, day, sport, time_slots):
                 continue
             proceed_to_next(page)
 
-            wait_random()  # Wait a moment before selecting number of players
             select_num_players(page, 1 + extra_player_count)
 
-            wait_random()  # Wait a moment before adding players
             # Player and confirmation flow
             if extra_player_count > 0:
                 add_players(page, extra_player_count)
-            wait_random()  # Wait a moment before proceeding
             proceed_to_next(page)
-            wait_random()  # Wait a moment before confirming
             confirm_booking(page)
 
             logging.info("Successfully booked court for %s at %s",
