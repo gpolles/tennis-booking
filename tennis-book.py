@@ -376,17 +376,23 @@ def book_court(
     time_slots: list[str],
     sports: list[str] | None = None,
     extra_player_count: int = 0,
-) -> None:
+) -> bool:
     """Complete flow: login, select sport/days, select times, and book.
 
     Args:
         playwright: Playwright instance
         username: Email for login
         password: Password for login
-        days: Days to book (e.g., ['Sat'])
+        day: Day to book (e.g., 'Sat')
         time_slots: End of time slots to book (e.g., ['8:30am', '9am'])
-        sport: Sport type (default: 'Tennis')
+        sports: Sport types to try (default: ['Tennis', 'Free Play'])
         extra_player_count: Number of additional players to add (default: 0)
+
+    Returns:
+        bool: True if booking was successful, False if no slots available
+
+    Raises:
+        Exception: If an error occurs during the booking process
     """
     if sports is None:
         sports = ["Tennis", "Free Play"]
@@ -394,7 +400,6 @@ def book_court(
     context = browser.new_context()
     page = context.new_page()
 
-    success = False
     try:
         # Login flow
         login(page, username, password)
@@ -415,82 +420,146 @@ def book_court(
             confirm_booking(page)
 
             logging.info("Successfully booked court for %s at %s", day, time_slots)
-            success = True
-            break  # Exit after successful booking
+            return True  # Exit after successful booking
+
+        # No sports had available slots
+        return False
 
     finally:
         context.close()
         browser.close()
 
-    # after browser closed, persist the booked slots if successful
-    if success:
-        try:
-            for time_slot in time_slots:
-                save_booked_slot(day, time_slot)
-        except Exception:
-            logging.exception("Failed to save booked slots")
-        send_pushover_message(
-            PUSHOVER_USER_KEY,
-            PUSHOVER_API_TOKEN,
-            f"Successfully booked {day} at {', '.join(time_slots)}",
-            title="Tennis Court Booking Success",
-        )
-    else:
-        logging.info("No available time slots found for the specified parameters.")
-        send_pushover_message(
-            PUSHOVER_USER_KEY,
-            PUSHOVER_API_TOKEN,
-            f"No available time slots found for {day}",
-            title="Tennis Court Booking Failed",
-        )
-    return success
 
+def run_bookings() -> dict:
+    """Run the booking process and return results.
 
-def main():
-    """Main entry point for the application."""
+    Raises:
+        ValueError: If required environment variables are not set
+        ValueError: If BOOKING_SLOTS is invalid or empty
+
+    Returns:
+        dict: Booking results with keys:
+            - successful: list of (day, time_slots) tuples that were booked
+            - unavailable: list of (day, time_slots) tuples with no available slots
+            - skipped: list of (day, time_slots) tuples that were already booked
+    """
     if not USER_NAME or not USER_PWD:
-        logging.error(
-            "Error: PLAYBYPOINT_EMAIL and PLAYBYPOINT_PASSWORD environment variables required"
+        raise ValueError(
+            "PLAYBYPOINT_EMAIL and PLAYBYPOINT_PASSWORD environment variables required"
         )
-        return
 
     # Parse booking slots from environment variable
     bookings = parse_booking_slots(BOOKING_SLOTS_ENV)
     if not bookings:
-        logging.error(
-            "Error: BOOKING_SLOTS environment variable not set or invalid format. "
+        raise ValueError(
+            "BOOKING_SLOTS environment variable not set or invalid format. "
             "Expected format: 'day1_slot1_slot2:...,day2_slot1_slot2:...'"
         )
-        return
 
     # Load already booked slots
     booked_slots = load_booked_slots()
 
-    # Filter out already-booked slots
-    pending_bookings = []
+    # Categorize bookings
+    results = {"successful": [], "unavailable": [], "skipped": []}
+
     for day, time_slots in bookings:
         # Keep only time slots that haven't been booked yet
         pending_slots = [slot for slot in time_slots if (day, slot) not in booked_slots]
-        if pending_slots:
-            pending_bookings.append((day, pending_slots))
-        else:
+        if not pending_slots:
+            results["skipped"].append((day, time_slots))
             logging.info("All slots for %s are already booked", day)
+            continue
 
-    if not pending_bookings:
-        logging.info("All requested slots are already booked; exiting.")
-        return
-
-    with sync_playwright() as playwright:
-        for day, time_slots in pending_bookings:
-            book_court(
+        # Try to book pending slots
+        with sync_playwright() as playwright:
+            success = book_court(
                 playwright,
                 username=USER_NAME,
                 password=USER_PWD,
                 day=day,
-                time_slots=time_slots,
+                time_slots=pending_slots,
                 sports=["Tennis", "Free Play"],
                 extra_player_count=1,
             )
+
+            if success:
+                # Save booked slots
+                for time_slot in pending_slots:
+                    save_booked_slot(day, time_slot)
+                results["successful"].append((day, pending_slots))
+            else:
+                results["unavailable"].append((day, pending_slots))
+
+    return results
+
+
+def format_booking_results(results: dict) -> str:
+    """Format booking results for notification.
+
+    Args:
+        results: Dictionary from run_bookings() with successful/unavailable/skipped
+
+    Returns:
+        Formatted string describing the booking results
+    """
+    lines = []
+
+    if results["successful"]:
+        lines.append(f"✓ Successfully booked {len(results['successful'])} day(s):")
+        for day, slots in results["successful"]:
+            lines.append(f"  - {day}: {', '.join(slots)}")
+
+    if results["unavailable"]:
+        lines.append(f"✗ No available slots for {len(results['unavailable'])} day(s):")
+        for day, slots in results["unavailable"]:
+            lines.append(f"  - {day}: {', '.join(slots)}")
+
+    if results["skipped"]:
+        lines.append(f"⊘ Skipped {len(results['skipped'])} day(s) (already booked):")
+        for day, slots in results["skipped"]:
+            lines.append(f"  - {day}: {', '.join(slots)}")
+
+    return "\n".join(lines) if lines else "No bookings to process."
+
+
+def main():
+    """Main entry point for the application."""
+    try:
+        results = run_bookings()
+        message = format_booking_results(results)
+        logging.info("Booking results:\n%s", message)
+
+        # Notify with results
+        if results["successful"]:
+            send_pushover_message(
+                PUSHOVER_USER_KEY,
+                PUSHOVER_API_TOKEN,
+                message,
+                title="Tennis Court Bookings - Success!",
+            )
+        elif results["unavailable"]:
+            send_pushover_message(
+                PUSHOVER_USER_KEY,
+                PUSHOVER_API_TOKEN,
+                message,
+                title="Tennis Court Bookings - No Availability",
+            )
+        else:
+            send_pushover_message(
+                PUSHOVER_USER_KEY,
+                PUSHOVER_API_TOKEN,
+                message,
+                title="Tennis Court Bookings - All Already Booked",
+            )
+    except Exception as e:
+        logging.exception("Booking process failed")
+        send_pushover_message(
+            PUSHOVER_USER_KEY,
+            PUSHOVER_API_TOKEN,
+            f"Booking process failed with error:\n{e}",
+            title="Tennis Court Bookings - Error",
+        )
+        raise
 
 
 if __name__ == "__main__":
