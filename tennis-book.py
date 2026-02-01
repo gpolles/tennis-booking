@@ -3,21 +3,24 @@
 Tennis Book Application - Automated tennis court booking via PlayByPoint.
 """
 
-import os
-from playwright.sync_api import Playwright, sync_playwright
-import time
-import random
 import logging
+import os
+import random
 import sys
-from datetime import date, timedelta, datetime
+import time
+from datetime import date, timedelta
 from pathlib import Path
 
+import requests
+from playwright.sync_api import Playwright, sync_playwright
 
 # Credentials - use environment variables for security
 USER_NAME = os.getenv("PLAYBYPOINT_EMAIL", "")
 USER_PWD = os.getenv("PLAYBYPOINT_PASSWORD", "")
 BOOKED_DATE_FILE = os.getenv("BOOKED_DATE_FILE")
 BOOKING_SLOTS_ENV = os.getenv("BOOKING_SLOTS", "")
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
+PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 
 
 # Global wait constants: base wait (seconds) plus up-to `WAIT_JITTER` seconds random
@@ -30,7 +33,7 @@ def wait_random() -> None:
 
     Use global constants so timing is consistent and configurable from one place.
     """
-    time.sleep(WAIT_BASE + random.random() * WAIT_JITTER)
+    time.sleep(WAIT_BASE + random.random() * WAIT_JITTER)  # nosec B311
 
 
 # Configure logging to stdout
@@ -41,7 +44,37 @@ logging.basicConfig(
 )
 
 
-def ensure_element(locator, description: str, max_retries: int = 3, base_delay: float = 1.0):
+def send_pushover_message(user_key, api_token, message, title=None):
+    """Send a notification to Pushover. Prints errors but does not raise.
+
+    This helper is safe to call from exception handlers.
+    """
+    if not user_key or not api_token:
+        logging.warning("Pushover credentials not set; skipping notification.")
+        return
+
+    url = "https://api.pushover.net/1/messages.json"
+
+    payload = {
+        "token": api_token,
+        "user": user_key,
+        "message": message,
+    }
+
+    if title:
+        payload["title"] = title
+
+    try:
+        response = requests.post(url, data=payload, timeout=10)
+        response.raise_for_status()
+        logging.info("Pushover: message sent successfully")
+    except requests.exceptions.RequestException as e:
+        logging.exception(f"Pushover: failed to send message: {e}")
+
+
+def ensure_element(
+    locator, description: str, max_retries: int = 3, base_delay: float = 1.0
+):
     """Verify the given Playwright locator matches at least one element.
 
     Retries with exponential backoff if the element is not found.
@@ -59,17 +92,27 @@ def ensure_element(locator, description: str, max_retries: int = 3, base_delay: 
             count = locator.count()
             if count > 0:
                 return locator
-        except Exception as e:
+        except Exception:
             if attempt == max_retries - 1:
-                logging.error("Failed to query element after %d retries: %s", max_retries, description)
+                logging.error(
+                    "Failed to query element after %d retries: %s",
+                    max_retries,
+                    description,
+                )
                 raise
-        
+
         # Calculate exponential backoff with jitter
         if attempt < max_retries - 1:
-            delay = base_delay * (2 ** attempt) + random.random() * 0.1
-            logging.debug("Element not found: %s, retrying in %.2fs (attempt %d/%d)", description, delay, attempt + 1, max_retries)
+            delay = base_delay * (2**attempt) + random.random() * 0.1  # nosec B311
+            logging.debug(
+                "Element not found: %s, retrying in %.2fs (attempt %d/%d)",
+                description,
+                delay,
+                attempt + 1,
+                max_retries,
+            )
             time.sleep(delay)
-    
+
     logging.error("%s not found after %d retries.", description, max_retries)
     raise RuntimeError(f"{description} not found")
 
@@ -81,8 +124,7 @@ def _parse_date_iso(s: str) -> date | None:
     try:
         return date.fromisoformat(s)
     except Exception:
-        logging.warning(
-            "Could not parse saved date '%s' (expected YYYY-MM-DD)", s)
+        logging.warning("Could not parse saved date '%s' (expected YYYY-MM-DD)", s)
         return None
 
 
@@ -109,7 +151,9 @@ def parse_booking_slots(slots_str: str) -> list[tuple[str, list[str]]]:
         parts = day_entry.split("_")
         if len(parts) < 2:
             logging.warning(
-                "Invalid booking slot format '%s' (expected day_slot1_slot2_...)", day_entry)
+                "Invalid booking slot format '%s' (expected day_slot1_slot2_...)",
+                day_entry,
+            )
             continue
         day = parts[0].strip()
         time_slots = [slot.strip() for slot in parts[1:]]
@@ -188,8 +232,7 @@ def next_date_for_day(day_str: str, reference: date | None = None) -> date:
         reference = date.today()
     name = day_str.strip()
     key = name[:3].capitalize()
-    abb_to_wday = {"Mon": 0, "Tue": 1, "Wed": 2,
-                   "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+    abb_to_wday = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
     target = abb_to_wday.get(key)
     if target is None:
         return reference
@@ -278,8 +321,7 @@ def explore_and_select_times(page, day: str, sport: str, end_times: list[str]) -
         try:
             ensure_element(end_button, f"Time slot ending at {end_time}")
         except RuntimeError:
-            logging.warning(
-                "No available time slot ending at %s found.", end_time)
+            logging.warning("No available time slot ending at %s found.", end_time)
             return False
 
         buttons.append(end_button)
@@ -326,9 +368,15 @@ def select_num_players(page, count: int) -> None:
     num_btn.click()
 
 
-def book_court(playwright: Playwright, username: str, password: str,
-               day: str, time_slots: list[str],
-               sports: list[str] = ["Tennis", "Free Play"], extra_player_count: int = 0) -> None:
+def book_court(
+    playwright: Playwright,
+    username: str,
+    password: str,
+    day: str,
+    time_slots: list[str],
+    sports: list[str] | None = None,
+    extra_player_count: int = 0,
+) -> None:
     """Complete flow: login, select sport/days, select times, and book.
 
     Args:
@@ -340,6 +388,8 @@ def book_court(playwright: Playwright, username: str, password: str,
         sport: Sport type (default: 'Tennis')
         extra_player_count: Number of additional players to add (default: 0)
     """
+    if sports is None:
+        sports = ["Tennis", "Free Play"]
     browser = playwright.chromium.launch(headless=True)
     context = browser.new_context()
     page = context.new_page()
@@ -364,8 +414,7 @@ def book_court(playwright: Playwright, username: str, password: str,
             proceed_to_next(page)
             confirm_booking(page)
 
-            logging.info("Successfully booked court for %s at %s",
-                         day, time_slots)
+            logging.info("Successfully booked court for %s at %s", day, time_slots)
             success = True
             break  # Exit after successful booking
 
@@ -380,9 +429,20 @@ def book_court(playwright: Playwright, username: str, password: str,
                 save_booked_slot(day, time_slot)
         except Exception:
             logging.exception("Failed to save booked slots")
+        send_pushover_message(
+            PUSHOVER_USER_KEY,
+            PUSHOVER_API_TOKEN,
+            f"Successfully booked {day} at {', '.join(time_slots)}",
+            title="Tennis Court Booking Success",
+        )
     else:
-        logging.info(
-            "No available time slots found for the specified parameters.")
+        logging.info("No available time slots found for the specified parameters.")
+        send_pushover_message(
+            PUSHOVER_USER_KEY,
+            PUSHOVER_API_TOKEN,
+            f"No available time slots found for {day}",
+            title="Tennis Court Booking Failed",
+        )
     return success
 
 
@@ -390,7 +450,8 @@ def main():
     """Main entry point for the application."""
     if not USER_NAME or not USER_PWD:
         logging.error(
-            "Error: PLAYBYPOINT_EMAIL and PLAYBYPOINT_PASSWORD environment variables required")
+            "Error: PLAYBYPOINT_EMAIL and PLAYBYPOINT_PASSWORD environment variables required"
+        )
         return
 
     # Parse booking slots from environment variable
@@ -398,7 +459,8 @@ def main():
     if not bookings:
         logging.error(
             "Error: BOOKING_SLOTS environment variable not set or invalid format. "
-            "Expected format: 'day1_slot1_slot2:...,day2_slot1_slot2:...'")
+            "Expected format: 'day1_slot1_slot2:...,day2_slot1_slot2:...'"
+        )
         return
 
     # Load already booked slots
@@ -408,10 +470,7 @@ def main():
     pending_bookings = []
     for day, time_slots in bookings:
         # Keep only time slots that haven't been booked yet
-        pending_slots = [
-            slot for slot in time_slots
-            if (day, slot) not in booked_slots
-        ]
+        pending_slots = [slot for slot in time_slots if (day, slot) not in booked_slots]
         if pending_slots:
             pending_bookings.append((day, pending_slots))
         else:
@@ -430,7 +489,7 @@ def main():
                 day=day,
                 time_slots=time_slots,
                 sports=["Tennis", "Free Play"],
-                extra_player_count=1
+                extra_player_count=1,
             )
 
 
